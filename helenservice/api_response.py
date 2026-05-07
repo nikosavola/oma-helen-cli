@@ -1,10 +1,10 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any
 
 
-@dataclass
+@dataclass(init=False, repr=True, eq=True)
 class SpotPriceChartSeries:
     start: str
     stop: str
@@ -34,7 +34,7 @@ class SpotPriceChartSeries:
         self.electricity_spot_prices_hour_average = electricity_spot_prices_hour_average
 
 
-@dataclass
+@dataclass(init=False, repr=True, eq=True)
 class SpotPriceChartResponse:
     start: str
     stop: str
@@ -43,8 +43,8 @@ class SpotPriceChartResponse:
     ids: dict[str, Any]
     data_start_times: dict[str, Any]
     data_stop_times: dict[str, Any]
-    series: list[SpotPriceChartSeries] = field(default_factory=list)
-    missing_series: list[Any] = field(default_factory=list)
+    series: list[SpotPriceChartSeries]
+    missing_series: list[Any]
 
     def __init__(
         self,
@@ -70,7 +70,7 @@ class SpotPriceChartResponse:
         self.missing_series = missing_series if missing_series is not None else []
 
 
-@dataclass
+@dataclass(init=False, repr=True, eq=True)
 class MeasurementsWithSpotPriceSeries:
     start: str
     stop: str
@@ -100,7 +100,7 @@ class MeasurementsWithSpotPriceSeries:
         self.ambient_humidity = ambient_humidity
 
 
-@dataclass
+@dataclass(init=False, repr=True, eq=True)
 class MeasurementsWithSpotPriceResponse:
     start: str
     stop: str
@@ -109,8 +109,8 @@ class MeasurementsWithSpotPriceResponse:
     ids: dict[str, Any]
     data_start_times: dict[str, Any]
     data_stop_times: dict[str, Any]
-    series: list[MeasurementsWithSpotPriceSeries] = field(default_factory=list)
-    missing_series: list[Any] = field(default_factory=list)
+    series: list[MeasurementsWithSpotPriceSeries]
+    missing_series: list[Any]
 
     def __init__(
         self,
