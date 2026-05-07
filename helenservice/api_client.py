@@ -1,5 +1,8 @@
+from __future__ import annotations
+
 import logging
 from datetime import date, datetime, timedelta
+from typing import Any
 from zoneinfo import ZoneInfo
 
 import requests
@@ -14,34 +17,33 @@ from .api_response import (
 from .const import HTTP_READ_TIMEOUT, RESOLUTION_HOUR
 from .helen_session import HelenSession
 
+logger = logging.getLogger(__name__)
 
-# TODO: consider moving all calculation functions somewhere else - they are not related to HelenApiClient
+
 class HelenApiClient:
     HELEN_API_URL_V25 = "https://api.omahelen.fi/v25"
     HELEN_API_URL_V26 = "https://api.omahelen.fi/v26"
     SPOT_PRICES_CHART_ENDPOINT = "/chart-data/electricity/spot-prices/daily"
     CONTRACT_ENDPOINT = "/contract/list"
 
-    _latest_login_time: datetime = None
-    _session: HelenSession = None
-    _margin: float = None
-    _selected_delivery_site_id: str = None
-    _selected_contract = None
-    _all_active_contracts = None
+    def __init__(self, tax: float | None = None, margin: float | None = None) -> None:
+        self._tax: float = 0.255 if tax is None else tax
+        self._margin: float = 0.38 if margin is None else margin
+        self._cache: TTLCache = TTLCache(maxsize=128, ttl=3600)
+        self._latest_login_time: datetime | None = None
+        self._session: HelenSession | None = None
+        self._selected_delivery_site_id: str | None = None
+        self._selected_contract: dict[str, Any] | None = None
+        self._all_active_contracts: list[dict[str, Any]] | None = None
 
-    def __init__(self, tax: float = None, margin: float = None):
-        self._tax = 0.255 if tax is None else tax
-        self._margin = 0.38 if margin is None else margin
-        self._cache = TTLCache(maxsize=128, ttl=3600)
-
-    def login_and_init(self, username, password):
+    def login_and_init(self, username: str, password: str) -> HelenApiClient:
         """Login to Oma Helen. Creates a new session when called."""
         self._session = HelenSession().login(username, password)
         self._latest_login_time = datetime.now()
         self._refresh_api_client_state()
         return self
 
-    def is_session_valid(self):
+    def is_session_valid(self) -> bool:
         """If the latest login has happened within the last hour, then the session should be valid and ready to go"""
         if self._latest_login_time is None:
             return False
@@ -49,15 +51,15 @@ class HelenApiClient:
         is_latest_login_within_hour = now - timedelta(hours=1) <= self._latest_login_time <= now
         return is_latest_login_within_hour
 
-    def close(self):
+    def close(self) -> None:
         if self._session is not None:
             self._session.close()
 
-    def _get_hourly_consumption_costs(self, start_date: date, end_date: date) -> list:
+    def _get_hourly_consumption_costs(self, start_date: date, end_date: date) -> list[float]:
         series = self.get_measurements_with_spot_prices(start_date, end_date, RESOLUTION_HOUR).series
         if not series:
             return []
-        hourly_consumption_costs = []
+        hourly_consumption_costs: list[float] = []
         for entry in series:
             if entry.electricity is None or entry.electricity_spot_prices is None:
                 continue
@@ -65,7 +67,7 @@ class HelenApiClient:
             hourly_consumption_costs.append(abs(hourly_price_with_tax_and_margin * entry.electricity))
         return hourly_consumption_costs
 
-    def calculate_transfer_fees_between_dates(self, start_date: date, end_date: date):
+    def calculate_transfer_fees_between_dates(self, start_date: date, end_date: date) -> float:
         """Calculate your total transfer fee costs including the monthly base price
 
         Returns the price in euros
@@ -81,7 +83,7 @@ class HelenApiClient:
         total_consumption = sum(abs(entry.electricity) for entry in series if entry.electricity is not None)
         return total_consumption
 
-    def calculate_total_costs_by_spot_prices_between_dates(self, start_date: date, end_date: date):
+    def calculate_total_costs_by_spot_prices_between_dates(self, start_date: date, end_date: date) -> float:
         """Calculate your total electricity cost with according spot prices by hourly precision.
         Note: Spot prices include the user-configured tax and margin.
 
@@ -101,8 +103,10 @@ class HelenApiClient:
         A negative number decreases and a positive number increases the base price.
 
         According to Helen, the impact is calculated with formula (A-B) / E = c/kWh, where
-        A = the sum of hourly consumption multiplied with the hourly price (i.e. your weighted average price of each hour)
-        B = total consumption multiplied with the whole month's average market price (i.e. your average price of the whole month)
+        A = the sum of hourly consumption multiplied with the hourly price
+            (i.e. your weighted average price of each hour)
+        B = total consumption multiplied with the whole month's average market price
+            (i.e. your average price of the whole month)
         E = total consumption
         """
         series = self.get_measurements_with_spot_prices(start_date, end_date, RESOLUTION_HOUR).series
@@ -176,6 +180,7 @@ class HelenApiClient:
             headers=self._api_request_headers(),
             timeout=HTTP_READ_TIMEOUT,
         )
+        response.raise_for_status()
 
         return MeasurementsWithSpotPriceResponse(**response.json())
 
@@ -200,54 +205,58 @@ class HelenApiClient:
             headers=self._api_request_headers(),
             timeout=HTTP_READ_TIMEOUT,
         )
+        response.raise_for_status()
 
         return SpotPriceChartResponse(**response.json())
 
     @cachedmethod(lambda self: self._cache)
-    def get_contract_data_json(self):
+    def get_contract_data_json(self) -> list[dict[str, Any]]:
         """Get your contract data."""
 
         contract_url = self.HELEN_API_URL_V25 + self.CONTRACT_ENDPOINT
         contract_params = {"include_transfer": "true", "update": "true", "include_products": "true"}
-        contract_response_dict = requests.get(
+        response = requests.get(
             contract_url,
             headers=self._api_request_headers(),
             timeout=HTTP_READ_TIMEOUT,
             params=contract_params,
-        ).json()
-        contracts_dict = contract_response_dict["contracts"]
+        )
+        response.raise_for_status()
+        contract_response_dict = response.json()
+        contracts_dict: list[dict[str, Any]] = contract_response_dict["contracts"]
 
         return contracts_dict
 
-    def get_all_delivery_site_ids(self) -> list[int]:
+    def get_all_delivery_site_ids(self) -> list[str]:
         """Get all delivery site ids from your contracts."""
 
         self._refresh_api_client_state()
-        delivery_sites = list(map(lambda contract: str(contract["delivery_site"]["id"]), self._all_active_contracts))
+        delivery_sites = [str(contract["delivery_site"]["id"]) for contract in self._all_active_contracts]
         return delivery_sites
 
-    def get_all_gsrn_ids(self) -> list[int]:
+    def get_all_gsrn_ids(self) -> list[str]:
         """Get all GSRN ids from your contracts."""
 
         self._refresh_api_client_state()
-        gsrn_ids = list(map(lambda contract: str(contract["gsrn"]), self._all_active_contracts))
+        gsrn_ids = [str(contract["gsrn"]) for contract in self._all_active_contracts]
         return gsrn_ids
 
-    def select_delivery_site_if_valid_id(self, delivery_site_id: str = None):
+    def select_delivery_site_if_valid_id(self, delivery_site_id: str | None = None) -> None:
         """Select a delivery site to be used when querying data."""
         delivery_sites = self.get_all_delivery_site_ids()
         gsrn_ids = self.get_all_gsrn_ids()
-        found_delivery_site_id = next(filter(lambda id: str(id) == delivery_site_id, delivery_sites), None)
+        found_delivery_site_id = next((sid for sid in delivery_sites if sid == delivery_site_id), None)
         if not found_delivery_site_id:
-            found_delivery_site_id = next(filter(lambda id: str(id) == delivery_site_id, gsrn_ids), None)
+            found_delivery_site_id = next((gid for gid in gsrn_ids if gid == delivery_site_id), None)
         if not found_delivery_site_id:
             raise InvalidDeliverySiteException(
-                f"Cannot select {delivery_site_id} because it does not exist in the active delivery sites list {delivery_sites} or GSRN id list {gsrn_ids}"
+                f"Cannot select {delivery_site_id} because it does not exist in the active"
+                f" delivery sites list {delivery_sites} or GSRN id list {gsrn_ids}"
             )
         self._selected_delivery_site_id = str(found_delivery_site_id)
         self._refresh_api_client_state()
         self._invalidate_caches()
-        logging.warning("Delivery site set to '%s'", delivery_site_id)
+        logger.warning("Delivery site set to '%s'", delivery_site_id)
 
     def get_contract_base_price(self) -> float:
         """Get the contract base price from your contract data."""
@@ -256,29 +265,29 @@ class HelenApiClient:
         contract = self._selected_contract
         if not contract:
             raise InvalidApiResponseException("Contract data is empty or None")
-        products = contract["products"] if contract else []
-        product = next(filter(lambda p: p["product_type"] == "energy", products), None)
+        products: list[dict[str, Any]] = contract.get("products", [])
+        product = next((p for p in products if p["product_type"] == "energy"), None)
         if not product:
-            logging.warning("Could not resolve contract base price from Helen API response. Returning 0.0")
+            logger.warning("Could not resolve contract base price from Helen API response. Returning 0.0")
             return 0.0
-        components = product["components"] if product else []
-        base_price_component = next(filter(lambda component: component["is_base_price"], components), None)
+        components: list[dict[str, Any]] = product.get("components", [])
+        base_price_component = next((c for c in components if c["is_base_price"]), None)
         if not base_price_component:
-            logging.warning("Could not resolve contract base price from Helen API response. Returning 0.0")
+            logger.warning("Could not resolve contract base price from Helen API response. Returning 0.0")
             return 0.0
         return base_price_component["price"]
 
-    def get_contract_type(self) -> str:
+    def get_contract_type(self) -> str | None:
         """Get the contract type as a string from your contract data."""
 
         self._refresh_api_client_state()
         contract = self._selected_contract
         if not contract:
             raise InvalidApiResponseException("Contract data is empty or None")
-        products = contract["products"] if contract else []
-        product = next(filter(lambda p: p["product_type"] == "energy", products), None)
+        products: list[dict[str, Any]] = contract.get("products", [])
+        product = next((p for p in products if p["product_type"] == "energy"), None)
         if not product:
-            logging.warning("Could not resolve contract type from Helen API response. Returning None")
+            logger.warning("Could not resolve contract type from Helen API response. Returning None")
             return None
         return product["id"]
 
@@ -292,62 +301,66 @@ class HelenApiClient:
         contract = self._selected_contract
         if not contract:
             raise InvalidApiResponseException("Contract data is empty or None")
-        products = contract["products"] if contract else []
-        product = next(filter(lambda p: p["product_type"] == "energy", products), None)
+        products: list[dict[str, Any]] = contract.get("products", [])
+        product = next((p for p in products if p["product_type"] == "energy"), None)
         if not product:
-            logging.warning("Could not resolve energy price from Helen API response. Returning 0.0")
+            logger.warning("Could not resolve energy price from Helen API response. Returning 0.0")
             return 0.0
-        if not product:
-            raise InvalidApiResponseException("Product data is empty or None")
-        components = product["components"] if product else []
-        energy_unit_price_component = next(filter(lambda component: component["name"] == "Energia", components), None)
+        components: list[dict[str, Any]] = product.get("components", [])
+        energy_unit_price_component = next((c for c in components if c["name"] == "Energia"), None)
         if not energy_unit_price_component:
-            logging.warning("Could not resolve energy price from Helen API response. Returning 0.0")
+            logger.warning("Could not resolve energy price from Helen API response. Returning 0.0")
             return 0.0
         return energy_unit_price_component["price"]
 
     def get_transfer_fee(self) -> float:
-        """Get the transfer fee price (c/kWh) from your contract data. Returns '0.0' if Helen is not your transfer company"""
+        """Get the transfer fee price (c/kWh) from your contract data.
+
+        Returns '0.0' if Helen is not your transfer company.
+        """
 
         self._refresh_api_client_state()
         contract = self._selected_contract
         if not contract:
             raise InvalidApiResponseException("Contract data is empty or None")
-        products = contract["products"] if contract else []
-        product = next(filter(lambda p: p["product_type"] == "transfer", products), None)
+        products: list[dict[str, Any]] = contract.get("products", [])
+        product = next((p for p in products if p["product_type"] == "transfer"), None)
         if not product:
-            logging.warning("Could not resolve transfer fees from Helen API response. Returning 0.0")
+            logger.warning("Could not resolve transfer fees from Helen API response. Returning 0.0")
             return 0.0
-        components = product["components"] if product else []
-        transfer_fee_component = next(filter(lambda component: component["name"] == "Siirtomaksu", components), None)
+        components: list[dict[str, Any]] = product.get("components", [])
+        transfer_fee_component = next((c for c in components if c["name"] == "Siirtomaksu"), None)
         if transfer_fee_component is None:
-            logging.warning("Could not resolve transfer fees from Helen API response. Returning 0.0")
+            logger.warning("Could not resolve transfer fees from Helen API response. Returning 0.0")
             return 0.0
         return transfer_fee_component["price"]
 
     def get_transfer_base_price(self) -> float:
-        """Get the transfer base price (eur) from your contract data. Returns '0.0' if Helen is not your transfer company"""
+        """Get the transfer base price (eur) from your contract data.
+
+        Returns '0.0' if Helen is not your transfer company.
+        """
 
         self._refresh_api_client_state()
         contract = self._selected_contract
         if not contract:
             raise InvalidApiResponseException("Contract data is empty or None")
-        products = contract["products"] if contract else []
-        product = next(filter(lambda p: p["product_type"] == "transfer", products), None)
+        products: list[dict[str, Any]] = contract.get("products", [])
+        product = next((p for p in products if p["product_type"] == "transfer"), None)
         if not product:
-            logging.warning("Could not resolve transfer base price from Helen API response. Returning 0.0")
+            logger.warning("Could not resolve transfer base price from Helen API response. Returning 0.0")
             return 0.0
-        components = product["components"] if product else []
-        transfer_base_price_component = next(filter(lambda component: component["is_base_price"], components), None)
+        components: list[dict[str, Any]] = product.get("components", [])
+        transfer_base_price_component = next((c for c in components if c["is_base_price"]), None)
         if transfer_base_price_component is None:
-            logging.warning("Could not resolve transfer base price from Helen API response. Returning 0.0")
+            logger.warning("Could not resolve transfer base price from Helen API response. Returning 0.0")
             return 0.0
         return transfer_base_price_component["price"]
 
-    def get_api_access_token(self):
+    def get_api_access_token(self) -> str:
         return self._session.get_access_token()
 
-    def _refresh_api_client_state(self):
+    def _refresh_api_client_state(self) -> None:
         contracts = self.get_contract_data_json()
         self._all_active_contracts = self._get_all_active_contracts(contracts)
 
@@ -359,19 +372,19 @@ class HelenApiClient:
             selected_active_contract = self._get_contract_by_delivery_site_id(self._all_active_contracts)
             self._selected_contract = selected_active_contract
 
-    def _invalidate_caches(self):
+    def _invalidate_caches(self) -> None:
         self._cache.clear()
 
-    def _api_request_headers(self):
+    def _api_request_headers(self) -> dict[str, str]:
         return {
             "Authorization": f"Bearer {self.get_api_access_token()}",
             "Accept": "application/json",
         }
 
-    def set_margin(self, margin: float):
+    def set_margin(self, margin: float) -> None:
         self._margin = margin
 
-    def _get_all_active_contracts(self, contracts):
+    def _get_all_active_contracts(self, contracts: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """
         Find all active contracts from a list of contracts.
         A contract is considered active if:
@@ -381,7 +394,7 @@ class HelenApiClient:
         """
         now = datetime.now()
 
-        def is_active_contract(contract):
+        def is_active_contract(contract: dict[str, Any]) -> bool:
             # Check if contract has started (start_date is not in future)
             start_date = datetime.strptime(contract["start_date"], '%Y-%m-%dT%H:%M:%S')
             if start_date > now:
@@ -399,54 +412,47 @@ class HelenApiClient:
 
         return list(filter(is_active_contract, contracts))
 
-    def _get_contract_by_delivery_site_id(self, contracts):
+    def _get_contract_by_delivery_site_id(self, contracts: list[dict[str, Any]]) -> dict[str, Any] | None:
         """
         Finds a contract from a list of contracts by delivery_site_id.
         """
         active_contracts = self._get_all_active_contracts(contracts)
         if self._selected_delivery_site_id:
             if len(str(self._selected_delivery_site_id)) == 18:
-                active_contracts = list(
-                    filter(
-                        lambda contract: contract["gsrn"] == str(self._selected_delivery_site_id),
-                        active_contracts,
-                    )
-                )
+                active_contracts = [
+                    contract
+                    for contract in active_contracts
+                    if contract["gsrn"] == str(self._selected_delivery_site_id)
+                ]
             else:
-                active_contracts = list(
-                    filter(
-                        lambda contract: str(contract["delivery_site"]["id"]) == str(self._selected_delivery_site_id),
-                        active_contracts,
-                    )
-                )
-        if active_contracts.__len__() > 1:
-            logging.debug("Found multiple active Helen contracts. Using the newest one.")
+                active_contracts = [
+                    contract
+                    for contract in active_contracts
+                    if str(contract["delivery_site"]["id"]) == str(self._selected_delivery_site_id)
+                ]
+        if len(active_contracts) > 1:
+            logger.debug("Found multiple active Helen contracts. Using the newest one.")
             active_contracts.sort(
                 key=lambda contract: datetime.strptime(contract["start_date"], '%Y-%m-%dT%H:%M:%S'),
                 reverse=True,
             )
-        if active_contracts.__len__() == 0:
-            logging.error("No active contracts found")
+        if len(active_contracts) == 0:
+            logger.error("No active contracts found")
             return None
         return active_contracts[0]
 
-    def _get_latest_contract(self, contracts):
+    def _get_latest_contract(self, contracts: list[dict[str, Any]]) -> dict[str, Any] | None:
         """
         Resolves the latest contract from a list of contracts.
         """
-        if contracts.__len__() == 0:
-            logging.error("No contracts found")
+        if len(contracts) == 0:
+            logger.error("No contracts found")
             return None
         contracts.sort(
             key=lambda contract: datetime.strptime(contract["start_date"], '%Y-%m-%dT%H:%M:%S'),
             reverse=True,
         )
         return contracts[0]
-
-    def _date_is_now_or_later(self, end_date_str):
-        end_date = datetime.strptime(end_date_str, '%Y-%m-%dT%H:%M:%S')
-        now = datetime.now()
-        return end_date >= now
 
     def _get_utc_time_range(self, start_date: date, end_date: date) -> tuple[str, str]:
         """
